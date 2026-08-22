@@ -35,6 +35,7 @@ class TrainingParameters:
     N_STEPS = 2 ** 10  # number of time steps per process per data collection
     MINIBATCH_SIZE = int(2 ** 10)
     DEMONSTRATION_PROB = 0.1  # imitation learning rate
+    LAMBDA_COMM = 0.05  # Communication loss penalty weight
 
 
 class NetParameters:

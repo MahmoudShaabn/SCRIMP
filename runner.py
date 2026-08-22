@@ -8,7 +8,7 @@ from mapf_gym import MAPFEnv
 from model import Model
 from od_mstar3 import od_mstar
 from od_mstar3.col_set_addition import OutOfTimeError, NoSolutionError
-from util import one_step, update_perf, reset_env,set_global_seeds
+from util import one_step, update_perf, reset_env, set_global_seeds
 
 
 @ray.remote(num_cpus=1, num_gpus=SetupParameters.NUM_GPU / (TrainingParameters.N_ENVS + 1))
@@ -18,7 +18,7 @@ class Runner(object):
     def __init__(self, env_id):
         """initialize model0 and environment"""
         self.ID = env_id
-        set_global_seeds(env_id*123)
+        set_global_seeds(env_id * 123)
         self.num_agent = EnvParameters.N_AGENTS
         self.imitation_num_agent = EnvParameters.N_AGENTS
         self.one_episode_perf = {'num_step': 0, 'episode_reward': 0, 'invalid': 0, 'block': 0, 'num_leave_goal': 0,
@@ -50,6 +50,7 @@ class Runner(object):
                 mb_values_all, mb_done, mb_ps, mb_actions = [], [], [], [], [], [], [], [], [], [], []
             mb_hidden_state = []
             mb_message = []
+            mb_c_i = []
             mb_train_valid, mb_blocking = [], []
             performance_dict = {'per_r': [], 'per_in_r': [], 'per_ex_r': [], 'per_valid_rate': [],
                                 'per_episode_len': [], 'per_block': [],
@@ -62,10 +63,16 @@ class Runner(object):
                 mb_vector.append(self.vector)
                 mb_hidden_state.append(
                     [self.hidden_state[0].cpu().detach().numpy(), self.hidden_state[1].cpu().detach().numpy()])
-                mb_message.append(self.message)
-                actions, ps, values_in, values_ex, values_all, pre_block, self.hidden_state, num_invalid, self.message = \
+                mb_message.append(self.message.cpu().detach().numpy())
+                
+                actions, ps, values_in, values_ex, values_all, pre_block, self.hidden_state, num_invalid, new_raw_message, c_i = \
                     self.local_model.step(self.obs, self.vector, self.valid_actions, self.hidden_state,
                                           self.episodic_buffer.no_reward, self.message, self.num_agent)
+                
+                # Message caching logic
+                self.message = c_i * new_raw_message + (1.0 - c_i) * self.message
+                mb_c_i.append(c_i.cpu().detach().numpy())
+
                 self.one_episode_perf['invalid'] += num_invalid
                 mb_values_in.append(values_in)
                 mb_values_ex.append(values_ex)
@@ -143,6 +150,7 @@ class Runner(object):
             mb_done = np.asarray(mb_done, dtype=np.bool_)
             mb_hidden_state = np.stack(mb_hidden_state)
             mb_message = np.concatenate(mb_message, axis=0)
+            mb_c_i = np.concatenate(mb_c_i, axis=0)
             mb_train_valid = np.stack(mb_train_valid)
             mb_blocking = np.concatenate(mb_blocking, axis=0)
 
@@ -189,7 +197,7 @@ class Runner(object):
             mb_returns_all = np.add(mb_advs_all, mb_values_all)
 
         return mb_obs, mb_vector, mb_returns_in, mb_returns_ex, mb_returns_all, mb_values_in, mb_values_ex, \
-            mb_values_all, mb_actions, mb_ps, mb_hidden_state, mb_train_valid, mb_blocking, mb_message, \
+            mb_values_all, mb_actions, mb_ps, mb_hidden_state, mb_train_valid, mb_blocking, mb_message, mb_c_i, \
             len(performance_dict['per_r']), performance_dict
 
     def imitation(self, weights, total_steps):
@@ -222,7 +230,7 @@ class Runner(object):
                 except NoSolutionError:
                     print("nosol????", start_positions)
 
-                if obs is not None:  # no error
+                if obs is not None:
                     mb_obs.append(obs)
                     mb_vector.append(vector)
                     mb_actions.append(actions)
@@ -266,7 +274,7 @@ class Runner(object):
             actions = np.zeros(self.imitation_num_agent)
             for i in range(self.imitation_num_agent):
                 pos = path[t][i]
-                new_pos = path[t + 1][i]  # guaranteed to be in bounds by loop guard
+                new_pos = path[t + 1][i]
                 direction = (new_pos[0] - pos[0], new_pos[1] - pos[1])
                 actions[i] = self.imitation_env.world.get_action(direction)
             mb_actions.append(actions)
@@ -282,7 +290,7 @@ class Runner(object):
             vector[:, :, 4] = intrinsic_reward
             vector[:, :, 5] = min_dist
 
-            if not all(valid_actions):  # M* can not generate collisions
+            if not all(valid_actions):
                 print('invalid action')
                 return None, None, None, None
 

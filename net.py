@@ -67,6 +67,9 @@ class SCRIMPNet(nn.Module):
         self.blocking_layer = nn.Linear(NetParameters.NET_SIZE, 1)
         self.message_layer = nn.Linear(NetParameters.NET_SIZE, NetParameters.NET_SIZE)
 
+        # Gumbel-Softmax Communication Gating Head (Outputs Silent vs Transmit logits)
+        self.comm_gate_head = nn.Linear(NetParameters.NET_SIZE, 2)
+
         # transformer based communication block
         self.communication_layer = TransformerEncoder(d_model=NetParameters.D_MODEL,
                                                       d_hidden=NetParameters.D_HIDDEN,
@@ -119,6 +122,16 @@ class SCRIMPNet(nn.Module):
         value_in = self.value_layer_in(c1)
         value_ex = self.value_layer_ex(c1)
         blocking = torch.sigmoid(self.blocking_layer(c1))
-        message = self.message_layer(c1)
-        return policy, value_in, value_ex, blocking, policy_sig, output_state, policy_layer, message
 
+        # Gate computation
+        gate_logits = self.comm_gate_head(c1)
+        if self.training:
+            gate_decision = F.gumbel_softmax(gate_logits, tau=1.0, hard=True)
+        else:
+            gate_decision = F.one_hot(torch.argmax(gate_logits, dim=-1), num_classes=2).float()
+
+        c_i = gate_decision[..., 1:2]
+        raw_message = self.message_layer(c1)
+        gated_message = raw_message * c_i
+
+        return policy, value_in, value_ex, blocking, policy_sig, output_state, policy_layer, gated_message, c_i
