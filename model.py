@@ -1,202 +1,252 @@
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+import torch.optim as optim
+from torch.cuda.amp.autocast_mode import autocast
+from torch.cuda.amp.grad_scaler import GradScaler
 
 from alg_parameters import *
 from net import SCRIMPNet
 
 
 class Model(object):
-    """model wrapper for SCRIMPNet"""
+    """model0 of agents"""
 
-    def __init__(self, env_id, device, is_global=False):
+    def __init__(self, env_id, device, global_model=False):
         """initialization"""
         self.ID = env_id
         self.device = device
-        self.network = SCRIMPNet().to(device)
-        self.is_global = is_global
-        if is_global:
-            self.net_optimizer = torch.optim.Adam(self.network.parameters(), lr=TrainingParameters.LR)
-            self.scaler = GradScaler()
+        self.network = SCRIMPNet().to(device)  # neural network
+        if global_model:
+            self.net_optimizer = optim.Adam(self.network.parameters(), lr=TrainingParameters.lr)
+            # self.multi_gpu_net = torch.nn.DataParallel(self.network) # training on multiple GPU
+            self.net_scaler = GradScaler()  # automatic mixed precision
 
-    def step(self, obs, vector, valid_actions, input_state, no_reward, message, num_agent):
-        """sample actions and compute values for rollout worker"""
-        self.network.eval()
-        with torch.no_grad():
-            obs = torch.from_numpy(obs).to(self.device)
-            vector = torch.from_numpy(vector).to(self.device)
-            valid_actions = torch.from_numpy(valid_actions).to(self.device)
+    def step(self, observation, vector, valid_action, input_state, no_reward, message, num_agent):
+        """using neural network in training for prediction"""
+        num_invalid = 0
+        observation = torch.from_numpy(observation).to(self.device)
+        vector = torch.from_numpy(vector).to(self.device)
+        ps, v_in, v_ex, block, _, output_state, _, message, c_i = self.network(observation, vector, input_state,
+                                                                          message)
 
-            policy, value_in, value_ex, blocking, policy_sig, output_state, _, raw_message, c_i = \
-                self.network(obs, vector, input_state, message)
+        actions = np.zeros(num_agent)
+        ps = np.squeeze(ps.cpu().detach().numpy())
+        v_in = v_in.cpu().detach().numpy()  # intrinsic state values
+        v_ex = v_ex.cpu().detach().numpy()  # extrinsic  state values
+        scale_factor = IntrinsicParameters.SURROGATE1
+        if no_reward:
+            scale_factor = 0.0
+        v_all = v_ex + scale_factor * v_in  # total state values
+        block = np.squeeze(block.cpu().detach().numpy())
 
-            # Mask invalid actions
-            valid_policy = policy * valid_actions
-            valid_policy_sum = torch.sum(valid_policy, dim=-1, keepdim=True)
-            valid_policy = valid_policy / (valid_policy_sum + 1e-8)
+        for i in range(num_agent):
+            if np.argmax(ps[i], axis=-1) not in valid_action[i]:
+                num_invalid += 1
+            # choose action from complete action distribution
+            actions[i] = np.random.choice(range(EnvParameters.N_ACTIONS), p=ps[i].ravel())
+        return actions, ps, v_in, v_ex, v_all, block, output_state, num_invalid, message, c_i
 
-            dist = torch.distributions.Categorical(valid_policy)
-            actions = dist.sample()
-            
-            num_invalid = (valid_policy_sum == 0).sum().item()
+    def evaluate(self, observation, vector, valid_action, input_state, greedy, no_reward, message, num_agent):
+        """using neural network in evaluations of training code for prediction"""
+        num_invalid = 0
+        eval_action = np.zeros(num_agent)
+        observation = torch.from_numpy(np.asarray(observation)).to(self.device)
+        vector = torch.from_numpy(vector).to(self.device)
+        ps, v_in, v_ex, block, _, output_state, _, message, c_i = self.network(observation, vector, input_state, message)
 
-            values_in = value_in.cpu().numpy()
-            values_ex = value_ex.cpu().numpy()
-            values_all = values_in + values_ex
+        ps = np.squeeze(ps.cpu().detach().numpy())
+        block = np.squeeze(block.cpu().detach().numpy())
+        greedy_action = np.argmax(ps, axis=-1)
+        scale_factor = IntrinsicParameters.SURROGATE1
+        if no_reward:
+            scale_factor = 0.0
+        v_all = v_ex + scale_factor * v_in
+        v_all = v_all.cpu().detach().numpy()
 
-            return actions.cpu().numpy(), policy.cpu().numpy(), values_in, values_ex, values_all, \
-                blocking.cpu().numpy(), output_state, num_invalid, raw_message, c_i
-
-    def evaluate(self, obs, vector, valid_actions, input_state, greedy, no_reward, message, num_agent):
-        """sample actions during evaluation"""
-        self.network.eval()
-        with torch.no_grad():
-            obs = torch.from_numpy(obs).to(self.device)
-            vector = torch.from_numpy(vector).to(self.device)
-            valid_actions = torch.from_numpy(valid_actions).to(self.device)
-
-            policy, value_in, value_ex, blocking, policy_sig, output_state, _, raw_message, c_i = \
-                self.network(obs, vector, input_state, message)
-
-            valid_policy = policy * valid_actions
-            valid_policy_sum = torch.sum(valid_policy, dim=-1, keepdim=True)
-            valid_policy = valid_policy / (valid_policy_sum + 1e-8)
-
-            if greedy:
-                actions = torch.argmax(valid_policy, dim=-1).cpu().numpy().squeeze(0)
-            else:
-                dist = torch.distributions.Categorical(valid_policy)
-                actions = dist.sample().cpu().numpy().squeeze(0)
-
-            num_invalid = (valid_policy_sum == 0).sum().item()
-            values_all = (value_in + value_ex).cpu().numpy()
-
-            return actions, blocking.cpu().numpy(), output_state, num_invalid, values_all, \
-                policy.cpu().numpy(), raw_message, c_i
+        for i in range(num_agent):
+            if greedy_action[i] not in valid_action[i]:
+                num_invalid += 1
+            if not greedy:
+                eval_action[i] = np.random.choice(range(EnvParameters.N_ACTIONS), p=ps[i].ravel())
+        if greedy:
+            eval_action = greedy_action
+        return eval_action, block, output_state, num_invalid, v_all, ps, message, c_i
 
     def value(self, obs, vector, input_state, no_reward, message):
-        """compute critic values for GAE advantage computation"""
-        self.network.eval()
-        with torch.no_grad():
-            obs = torch.from_numpy(obs).to(self.device)
-            vector = torch.from_numpy(vector).to(self.device)
+        """using neural network to predict state values"""
+        obs = torch.from_numpy(obs).to(self.device)
+        vector = torch.from_numpy(vector).to(self.device)
+        _, v_in, v_ex, _, _, _, _, _, _ = self.network(obs, vector, input_state, message)
+        v_in = v_in.cpu().detach().numpy()
+        v_ex = v_ex.cpu().detach().numpy()
 
-            _, value_in, value_ex, _, _, _, _, _, _ = self.network(obs, vector, input_state, message)
-
-            values_in = value_in.cpu().numpy()
-            values_ex = value_ex.cpu().numpy()
-            values_all = values_in + values_ex
-
-            return values_in, values_ex, values_all
+        scale_factor = IntrinsicParameters.SURROGATE1
+        if no_reward:
+            scale_factor = 0.0
+        v_all = v_ex + scale_factor * v_in
+        return v_in, v_ex, v_all
 
     def generate_state(self, obs, vector, input_state, message):
-        """generate hidden state for imitation learning"""
-        self.network.eval()
-        with torch.no_grad():
-            obs = torch.from_numpy(obs).to(self.device)
-            vector = torch.from_numpy(vector).to(self.device)
+        """generate corresponding hidden states and messages in imitation learning"""
+        obs = torch.from_numpy(obs).to(self.device)
+        vector = torch.from_numpy(vector).to(self.device)
+        _, _, _, _, _, output_state, _, message, _ = self.network(obs, vector, input_state, message)
+        return output_state, message
 
-            _, _, _, _, _, output_state, _, message_out, _ = self.network(obs, vector, input_state, message)
-            return output_state, message_out
+    def final_evaluate(self, observation, vector, input_state, message, num_agent, greedy):
+        """using neural network in independent evaluations for prediction"""
+        eval_action = np.zeros(num_agent)
+        observation = torch.from_numpy(np.asarray(observation)).to(self.device)
+        vector = torch.from_numpy(vector).to(self.device)
+        ps, v_in, v_ex, _, _, output_state, _, message, _ = self.network(observation, vector, input_state, message)
 
-    def train(self, mb_obs, mb_vector, mb_returns_in, mb_returns_ex, mb_returns_all, mb_values_in,
-              mb_values_ex, mb_values_all, mb_actions, mb_ps, mb_hidden_state,
-              mb_train_valid, mb_blocking, mb_message, mb_c_i):
-        """PPO optimization step with communication loss penalty"""
-        self.network.train()
+        ps = np.squeeze(ps.cpu().detach().numpy())
+        greedy_action = np.argmax(ps, axis=-1)
+        scale_factor = IntrinsicParameters.SURROGATE1
+        v_all = v_ex + scale_factor * v_in
+        v_all = v_all.cpu().detach().numpy()
 
-        obs = torch.from_numpy(mb_obs).to(self.device)
-        vector = torch.from_numpy(mb_vector).to(self.device)
-        returns_in = torch.from_numpy(mb_returns_in).to(self.device).float()
-        returns_ex = torch.from_numpy(mb_returns_ex).to(self.device).float()
-        returns_all = torch.from_numpy(mb_returns_all).to(self.device).float()
-        old_values_all = torch.from_numpy(mb_values_all).to(self.device).float()
-        actions = torch.from_numpy(mb_actions).to(self.device).long()
-        old_ps = torch.from_numpy(mb_ps).to(self.device).float()
-        input_state = (torch.from_numpy(mb_hidden_state[:, 0]).to(self.device),
-                       torch.from_numpy(mb_hidden_state[:, 1]).to(self.device))
-        train_valid = torch.from_numpy(mb_train_valid).to(self.device).float()
-        blocking_target = torch.from_numpy(mb_blocking).to(self.device).float()
-        message = torch.from_numpy(mb_message).to(self.device)
+        for i in range(num_agent):
+            if not greedy:
+                eval_action[i] = np.random.choice(range(EnvParameters.N_ACTIONS), p=ps[i].ravel())
+        if greedy:
+            eval_action = greedy_action
+        return eval_action, output_state, v_all, ps, message
+
+    def train(self, observation, vector, returns_in, returns_ex, returns_all, old_v_in, old_v_ex, old_v_all, action,
+              old_ps, input_state, train_valid, target_blockings, message, mb_c_i):
+        """train model0 by reinforcement learning"""
+        self.net_optimizer.zero_grad()
+        # from numpy to torch
+        observation = torch.from_numpy(observation).to(self.device)
+        vector = torch.from_numpy(vector).to(self.device)
+        message = torch.from_numpy(message).to(self.device)
+
+        returns_in = torch.from_numpy(returns_in).to(self.device)
+        returns_ex = torch.from_numpy(returns_ex).to(self.device)
+        returns_all = torch.from_numpy(returns_all).to(self.device)
+
+        old_v_in = torch.from_numpy(old_v_in).to(self.device)
+        old_v_ex = torch.from_numpy(old_v_ex).to(self.device)
+        old_v_all = torch.from_numpy(old_v_all).to(self.device)
+
+        action = torch.from_numpy(action).to(self.device)
+        action = torch.unsqueeze(action, -1)
+        old_ps = torch.from_numpy(old_ps).to(self.device)
+
+        train_valid = torch.from_numpy(train_valid).to(self.device)
+        target_blockings = torch.from_numpy(target_blockings).to(self.device)
+
+        input_state_h = torch.from_numpy(
+            np.reshape(input_state[:, 0], (-1, NetParameters.NET_SIZE // 2))).to(self.device)
+        input_state_c = torch.from_numpy(
+            np.reshape(input_state[:, 1], (-1, NetParameters.NET_SIZE // 2))).to(self.device)
+        input_state = (input_state_h, input_state_c)
+
+        advantage = returns_all - old_v_all
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-6)
 
         with autocast():
-            policy, value_in, value_ex, blocking, _, _, policy_logits, _, c_i = \
-                self.network(obs, vector, input_state, message)
+            new_ps, new_v_in, new_v_ex, block, policy_sig, _, _, _, c_i = self.network(observation, vector, input_state,
+                                                                                  message)
+            new_p = new_ps.gather(-1, action)
+            old_p = old_ps.gather(-1, action)
+            ratio = torch.exp(torch.log(torch.clamp(new_p, 1e-6, 1.0)) - torch.log(torch.clamp(old_p, 1e-6, 1.0)))
 
-            # PPO Policy Loss
-            advantages = returns_all - old_values_all
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            entropy = torch.mean(-torch.sum(new_ps * torch.log(torch.clamp(new_ps, 1e-6, 1.0)), dim=-1, keepdim=True))
 
-            valid_policy = policy * train_valid
-            valid_policy_sum = torch.sum(valid_policy, dim=-1, keepdim=True)
-            valid_policy = valid_policy / (valid_policy_sum + 1e-8)
+            # intrinsic critic loss
+            new_v_in = torch.squeeze(new_v_in)
+            new_v_clipped_in = old_v_in + torch.clamp(new_v_in - old_v_in, - TrainingParameters.CLIP_RANGE,
+                                                      TrainingParameters.CLIP_RANGE)
+            value_losses1_in = torch.square(new_v_in - returns_in)
+            value_losses2_in = torch.square(new_v_clipped_in - returns_in)
+            critic_loss_in = torch.mean(torch.maximum(value_losses1_in, value_losses2_in))
 
-            action_dist = torch.distributions.Categorical(valid_policy)
-            new_log_probs = action_dist.log_prob(actions)
-            old_log_probs = torch.log(torch.gather(old_ps, -1, actions.unsqueeze(-1)).squeeze(-1) + 1e-8)
+            # extrinsic critic loss
+            new_v_ex = torch.squeeze(new_v_ex)
+            new_v_clipped_ex = old_v_ex + torch.clamp(new_v_ex - old_v_ex, - TrainingParameters.CLIP_RANGE,
+                                                      TrainingParameters.CLIP_RANGE)
+            value_losses1_ex = torch.square(new_v_ex - returns_ex)
+            value_losses2_ex = torch.square(new_v_clipped_ex - returns_ex)
+            critic_loss_ex = torch.mean(torch.maximum(value_losses1_ex, value_losses2_ex))
 
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1.0 - TrainingParameters.CLIP_RANGE,
-                                1.0 + TrainingParameters.CLIP_RANGE) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
+            # actor loss
+            ratio = torch.squeeze(ratio)
+            policy_losses = advantage * ratio
+            policy_losses2 = advantage * torch.clamp(ratio, 1.0 - TrainingParameters.CLIP_RANGE,
+                                                     1.0 + TrainingParameters.CLIP_RANGE)
+            policy_loss = torch.mean(torch.min(policy_losses, policy_losses2))
 
-            # Critic Value Losses
-            value_in = value_in.squeeze(-1)
-            value_ex = value_ex.squeeze(-1)
-            value_loss_in = F.mse_loss(value_in, returns_in)
-            value_loss_ex = F.mse_loss(value_ex, returns_ex)
-            value_loss = value_loss_in + value_loss_ex
+            # valid loss and blocking loss decreased by supervised learning
+            valid_loss = - torch.mean(torch.log(torch.clamp(policy_sig, 1e-6, 1.0 - 1e-6)) *
+                                      train_valid + torch.log(torch.clamp(1 - policy_sig, 1e-6, 1.0 - 1e-6)) * (
+                                              1 - train_valid))
+            block = torch.squeeze(block)
+            blocking_loss = - torch.mean(target_blockings * torch.log(torch.clamp(block, 1e-6, 1.0 - 1e-6))
+                                         + (1 - target_blockings) * torch.log(torch.clamp(1 - block, 1e-6, 1.0 - 1e-6)))
+    	    # Communications Loss
+            lambda_comm = getattr(TrainingParameters, 'LAMBDA_COMM', 0.01)
+            comm_loss = lambda_comm * torch.mean(c_i) 
 
-            # Blocking and Entropy
-            blocking_loss = F.binary_cross_entropy(blocking.squeeze(-1), blocking_target)
-            entropy = action_dist.entropy().mean()
+            # total loss
+            all_loss = -policy_loss - entropy * TrainingParameters.ENTROPY_COEF + \
+                TrainingParameters.IN_VALUE_COEF * critic_loss_in + \
+                TrainingParameters.EX_VALUE_COEF * critic_loss_ex + TrainingParameters.VALID_COEF * valid_loss \
+                + TrainingParameters.BLOCK_COEF * blocking_loss + comm_loss
 
-            # Communication Regularization Loss
-            lambda_comm = getattr(TrainingParameters, 'LAMBDA_COMM', 0.05)
-            comm_loss = lambda_comm * torch.mean(c_i)
+        clip_frac = torch.mean(torch.greater(torch.abs(ratio - 1.0), TrainingParameters.CLIP_RANGE).float())
 
-            total_loss = (policy_loss +
-                          TrainingParameters.VALUE_COEF * value_loss +
-                          TrainingParameters.BLOCKING_COEF * blocking_loss -
-                          TrainingParameters.ENTROPY_COEF * entropy +
-                          comm_loss)
+        self.net_scaler.scale(all_loss).backward()
+        self.net_scaler.unscale_(self.net_optimizer)
 
-        self.net_optimizer.zero_grad()
-        self.scaler.scale(total_loss).backward()
-        self.scaler.unscale_(self.net_optimizer)
-        nn.utils.clip_grad_norm_(self.network.parameters(), TrainingParameters.MAX_GRAD_NORM)
-        self.scaler.step(self.net_optimizer)
-        self.scaler.update()
+        # Clip gradient
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), TrainingParameters.MAX_GRAD_NORM)
 
-        return [total_loss.item(), policy_loss.item(), value_loss.item(), comm_loss.item()]
+        self.net_scaler.step(self.net_optimizer)
+        self.net_scaler.update()
 
-    def imitation_train(self, mb_obs, mb_vector, mb_actions, mb_hidden_state, mb_message):
-        """imitation learning optimization step"""
-        self.network.train()
+        stats_list = [all_loss.cpu().detach().numpy(), policy_loss.cpu().detach().numpy(),
+                      entropy.cpu().detach().numpy(),
+                      critic_loss_in.cpu().detach().numpy(), critic_loss_ex.cpu().detach().numpy(),
+                      valid_loss.cpu().detach().numpy(),
+                      blocking_loss.cpu().detach().numpy(),
+                      clip_frac.cpu().detach().numpy(), grad_norm.cpu().detach().numpy(),
+                      torch.mean(advantage).cpu().detach().numpy(),
+		      comm_loss.cpu().detach().numpy()]  # for recording
 
-        obs = torch.from_numpy(mb_obs).to(self.device)
-        vector = torch.from_numpy(mb_vector).to(self.device)
-        actions = torch.from_numpy(mb_actions).to(self.device).long()
-        input_state = (torch.from_numpy(mb_hidden_state[:, 0]).to(self.device),
-                       torch.from_numpy(mb_hidden_state[:, 1]).to(self.device))
-        message = torch.from_numpy(mb_message).to(self.device)
-
-        with autocast():
-            policy, _, _, _, _, _, _, _, _ = self.network(obs, vector, input_state, message)
-            imitation_loss = F.cross_entropy(policy.reshape(-1, EnvParameters.N_ACTIONS), actions.reshape(-1))
-
-        self.net_optimizer.zero_grad()
-        self.scaler.scale(imitation_loss).backward()
-        self.scaler.unscale_(self.net_optimizer)
-        nn.utils.clip_grad_norm_(self.network.parameters(), TrainingParameters.MAX_GRAD_NORM)
-        self.scaler.step(self.net_optimizer)
-        self.scaler.update()
-
-        return imitation_loss.item()
+        return stats_list
 
     def set_weights(self, weights):
-        """load network weights"""
+        """load global weights to local models"""
         self.network.load_state_dict(weights)
+
+    def imitation_train(self, observation, vector, optimal_action, input_state, message):
+        """train model0 by imitation learning"""
+        self.net_optimizer.zero_grad()
+
+        observation = torch.from_numpy(observation).to(self.device)
+        vector = torch.from_numpy(vector).to(self.device)
+        optimal_action = torch.from_numpy(optimal_action).to(self.device)
+        message = torch.from_numpy(message).to(self.device)
+        input_state_h = torch.from_numpy(
+            np.reshape(input_state[:, 0], (-1, NetParameters.NET_SIZE // 2))).to(self.device)
+        input_state_c = torch.from_numpy(
+            np.reshape(input_state[:, 1], (-1, NetParameters.NET_SIZE // 2))).to(self.device)
+
+        input_state = (input_state_h, input_state_c)
+
+        with autocast():
+            _, _, _, _, _, _, logits, _, _ = self.network(observation, vector, input_state, message)
+            logits = torch.swapaxes(logits, 1, 2)
+            imitation_loss = F.cross_entropy(logits, optimal_action)
+
+        self.net_scaler.scale(imitation_loss).backward()
+        self.net_scaler.unscale_(self.net_optimizer)
+        # clip gradient
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), TrainingParameters.MAX_GRAD_NORM)
+        self.net_scaler.step(self.net_optimizer)
+        self.net_scaler.update()
+
+        return [imitation_loss.cpu().detach().numpy(), grad_norm.cpu().detach().numpy()]  # for recording

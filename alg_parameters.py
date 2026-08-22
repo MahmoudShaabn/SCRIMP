@@ -19,6 +19,7 @@ class EnvParameters:
 
 class TrainingParameters:
     lr = 1e-5
+    LAMBDA_COMM = 0.01    # weight for communication penalty
     GAMMA = 0.95  # discount factor
     LAM = 0.95  # For GAE
     CLIP_RANGE = 0.2
@@ -35,7 +36,6 @@ class TrainingParameters:
     N_STEPS = 2 ** 10  # number of time steps per process per data collection
     MINIBATCH_SIZE = int(2 ** 10)
     DEMONSTRATION_PROB = 0.1  # imitation learning rate
-    LAMBDA_COMM = 0.05  # Communication loss penalty weight
 
 
 class NetParameters:
@@ -94,7 +94,7 @@ class RecordingParameters:
     TXT_NAME = 'alg.txt'
     LOSS_NAME = ['all_loss', 'policy_loss', 'policy_entropy', 'critic_loss_in', 'critic_loss_ex', 'valid_loss',
                  'blocking_loss', 'clipfrac',
-                 'grad_norm', 'advantage']
+                 'grad_norm', 'advantage', 'comm_loss']
 
 
 all_args = {'N_AGENTS': EnvParameters.N_AGENTS, 'N_ACTIONS': EnvParameters.N_ACTIONS,
