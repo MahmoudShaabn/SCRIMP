@@ -247,9 +247,10 @@ def main():
                     write_to_tensorboard(global_summary, curr_steps, eval_performance_dict, evaluate=True, greedy=False,
                                          )
 
-                print('episodes: {}, step: {},episode reward: {}, final goals: {} \n'.format(
+                print('episodes: {}, step: {}, episode reward: {:.1f}, final goals: {:.1f}, comm ratio: {:.2f}%\n'.format(
                     curr_episodes, curr_steps, eval_performance_dict['per_r'],
-                    eval_performance_dict['per_final_goals']))
+                    eval_performance_dict['per_final_goals'],
+                    eval_performance_dict.get('comm_ratio', 0.0) * 100)) #Add Communications Ratio logging
                 # save model with the best performance
                 if RecordingParameters.RECORD_BEST:
                     if eval_performance_dict['per_r'] > best_perf and (
@@ -327,6 +328,7 @@ def evaluate(eval_env, episodic_buffer, model, device, save_gif, curr_steps, gre
         one_episode_perf = {'num_step': 0, 'episode_reward': 0, 'invalid': 0, 'block': 0,
                             'num_leave_goal': 0, 'wrong_blocking': 0, 'num_collide': 0, 'reward_count': 0,
                             'ex_reward': 0, 'in_reward': 0}
+        total_transmissions = 0 #Add
         if save_gif:
             episode_frames.append(eval_env._render(mode='rgb_array', screen_width=900, screen_height=900))
 
@@ -340,6 +342,7 @@ def evaluate(eval_env, episodic_buffer, model, device, save_gif, curr_steps, gre
                                                                                                episodic_buffer.no_reward,
                                                                                                message, num_agent)
             message = c_i * raw_message + (1.0 - c_i) * message # Modified message
+            total_transmissions += c_i.sum().item()  # Accumulate transmission count
             one_episode_perf['invalid'] += num_invalid
 
             # move
@@ -365,6 +368,10 @@ def evaluate(eval_env, episodic_buffer, model, device, save_gif, curr_steps, gre
                 eval_performance_dict['per_half_goals'].append(num_on_goals)
 
             if done:
+                #Add 
+                total_opportunities = max(1, one_episode_perf['num_step'] * num_agent)
+                eval_performance_dict.setdefault('comm_ratio', []).append(total_transmissions / total_opportunities)
+                
                 # save gif
                 if save_gif:
                     if not os.path.exists(RecordingParameters.GIFS_PATH):
